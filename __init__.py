@@ -17,7 +17,7 @@ INDEXED_MODE = 4   #External Direct MOVX A,@DPTR
 CODE_MODE = 5       #Code Indirect   MOVC A,@A+DPTR
 BIT_ADDRESS_MODE = 6 #SETB bit_addr
 BIT_INDEXED_MODE = 7 #jnb ACC.0, code_addr
-BIT_CLEAR_MODE = 8 #MOV bit addr,C  
+FLAG_MODE = 8 #MOV bit addr,C  
 IMMEDIATE_OFFSET_MODE = 9 #CJNE A,#data,reladdr
 DIRECT_OFFSET_MODE = 10 #CJNE A,imm_data,reladdr
 
@@ -119,8 +119,9 @@ OperandTokenGen = [
         InstructionTextToken(TextToken,'.'),
         InstructionTextToken(TextToken, '{}'.format(1 >> value))
     ],
-    lambda reg, value, addr: [ # BIT_CLEAR_MODE "C"
-        InstructionTextToken(TextToken,'C'),
+    lambda reg, value, addr: [ # FLAG_MODE "C"
+        #InstructionTextToken(TextToken,'C'),
+        InstructionTextToken(RegisterToken,'C'),
     ],
     lambda reg, value, addr: [ #IMMEDIATE_OFFSET_MODE = 9 CJNE A,#data,reladdr
         InstructionTextToken(TextToken, '#'), 
@@ -176,7 +177,7 @@ SourceOperandsIL = [
     #jnb ACC.0, code_addr
     lambda il, width, reg, value: il.unimplemented(),
 
-    #bit clear mode
+    #Flag Mode
     lambda il, width, reg, value: il.flag('C'),
    
     #IMMEDIATE_OFFSET_MODE = 9 CJNE A,#data,reladdr 
@@ -207,7 +208,7 @@ DestOperandsIL = [
     lambda il, width, reg, value, src: il.store(width, il.reg(width, reg), src), 
 
     #INDEXED_MODE = 4   #External Direct MOVX A,@DPTR
-    lambda il, width, reg, value, src: il.store(width, il.reg(width, 'DPTR'), src), 
+    lambda il, width, reg, value, src: il.store(width, il.reg(2, 'DPTR'), src), 
     
     #CODE_MODE = 5       #Code Indirect   MOVC A,@A+DPTR
     lambda il, width, reg, value, src: il.unimplemented(),
@@ -218,8 +219,8 @@ DestOperandsIL = [
     #jnb ACC.0, code_addr
     lambda il, width, reg, value: il.unimplemented(),
    
-    #MOV bit addr,C 
-    lambda il, width, reg, value, src: il.and_expr(1, src, il.const(1, value), flags='onlyC'),
+    #flag mode 
+    lambda il, width, reg, value, src: il.flag_bit(width, il.flag('C'), reg),
     
     #IMMEDIATE_OFFSET_MODE = 9 CJNE A,#data,reladdr 
     lambda il, width, reg, value, src: il.unimplemented(),
@@ -231,7 +232,7 @@ DestOperandsIL = [
 
 def jump(il, dest):
     label = None
-    #log_debug("JUMP = il={}, il.dest={} il.dest.value={} il.op={} il.address={} il.dir={}".format(il, il[dest], il[dest].value, il[dest].operation, il[dest].address, dir(il[dest])))
+    #log_debug("JUMP = il={}, il.dest={} il.dest.value={} il.op={} il.address={} il.dir={}".format(il, il[dest], il[dest].value, il[dest].operation, hex(il[dest].address), dir(il[dest])))
     if il[dest].operation == LowLevelILOperation.LLIL_CONST:
         label = il.get_label_for_address(
             Architecture['i8051'],
@@ -282,6 +283,65 @@ def jnb(il, jump_const, jump_dest, address_to_check, bit_to_check):
     il.mark_label(f)
     return None
 
+def djnz_branch(il, src_op, dst_op, src, dst, jump_address, jump_length):
+    #log_debug("djnz branch  il={}, src_op={}, dst_op={}, src={}, dst={}, jump_address={}, jump_length={}".format(il, src_op, dst_op, src, dst, jump_address, jump_length))
+    if dst_op == REGISTER_MODE:
+        il.append(
+            il.store(1, 
+                il.reg(1, dst), 
+                il.sub(1, 
+                    il.reg(1, dst), 
+                    il.const(1, 1))
+                )
+            )
+        cond = il.compare_not_equal(1, 
+            il.reg(1, dst), 
+            il.const(1,0)) 
+    elif dst_op == DIRECT_MODE:
+        il.append(
+            il.store(1, 
+                il.const(1, dst), 
+                il.sub(1, 
+                    il.load(1, il.const(1, dst)), 
+                    il.const(1, 1))
+                )
+            )
+        cond = il.compare_not_equal(1, 
+            il.load(1, il.const(1, dst)), 
+            il.const(1,0))
+    t = il.get_label_for_address(
+        Architecture['i8051'],
+        jump_address 
+    )
+    if t is None:
+        t = LowLevelILLabel()
+        indirect = True
+    else:
+        indirect = False
+  
+    f_label_found = True
+    f = il.get_label_for_address(
+        Architecture['i8051'],
+        il.current_address + jump_length 
+    ) 
+    if f is None:
+        f = LowLevelILLabel()
+        f_label_found = False
+    
+    il.append(il.if_expr(
+       cond,
+       t,
+       f)
+    )
+    if indirect:
+        # If the destination is not in the current function,
+        # then a jump, rather than a goto, needs to be added to
+        # the IL.
+        il.mark_label(t)
+        il.append(il.jump(il.const(2,jump_address)))
+    if not f_label_found:
+        il.mark_label(f)
+
 def cond_branch(il, cond, dest, length):
     #log_debug("COND BRANCH = il={}, il.dest={} il.op={}".format(il, il[dest], il[dest].operation))
     t = il.get_label_for_address(
@@ -318,31 +378,34 @@ def cond_branch(il, cond, dest, length):
         il.mark_label(f)
 
 InstructionIL = {
-    'SETB': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: 
-        DestOperandsIL[DIRECT_MODE] (
-            il, width, dst, dst_value,
+    'SETB': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: [
+        (DestOperandsIL[DIRECT_MODE] (
+            il, width, src_value, None,
             il.or_expr(
                 width, 
                 SourceOperandsIL[DIRECT_MODE](
-                    il, width, dst, dst_value
+                    il, width, src_value, None 
                 ),
                 SourceOperandsIL[IMMEDIATE_MODE](
-                    il, width, dst_value, None
+                    il, width, dst_value, None 
                 )
             )
-        ),
-    'SETB C': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.flag_bit(1, 'C', 1), 
-    'MOV': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: 
-    [
-        DestOperandsIL[dst_op] (
-            il, width, dst, dst_value,
-            SourceOperandsIL[src_op](
-                il, width, src, src_value)
-        ),
-        (
+        )) if dst_op != FLAG_MODE
+        else (
             None
+        )
+        ],
+    #'SETB C': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.flag_bit(1, 'C', 1), 
+    'MOV': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: [
+        ( 
+            DestOperandsIL[dst_op] (
+                il, width, dst, dst_value,
+                SourceOperandsIL[src_op](
+                    il, width, src, src_value)
+        ) if dst_op != FLAG_MODE
+        else None
         ) 
-    ],
+        ],
     'MOVX': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: 
     [
         DestOperandsIL[dst_op] (
@@ -368,8 +431,8 @@ InstructionIL = {
     'NOP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.nop(),
     'RET': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.ret(il.pop(2)),
     'RETI': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.ret(il.pop(2)),
-    'LJMP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: jump(il, il.const(width, dst)),#il.jump(il.const(width, dst)),
-    #'SJMP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: jump(il, il.const(width, dst)),
+    'LJMP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.jump(il.const(2,dst)), 
+            #jump(il, il.const(2, dst)),
     'SJMP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: jump(il, il.const(width, dst)),
     'JMP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: 
         jump(il, 
@@ -378,7 +441,8 @@ InstructionIL = {
                     il.reg(2,'DPTR')
                 )
             ),
-    'PUSH': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.push(width, SourceOperandsIL[dst_op](il, width, dst, dst_value)),
+    'PUSH': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.push(width, il.load(width, il.const(1, dst))),
+#il.push(width, SourceOperandsIL[dst_op](il, width, dst, dst_value)),
     'POP': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: DestOperandsIL[dst_op](
             il, width, dst, dst_value, il.pop(width)
             ),
@@ -405,12 +469,12 @@ InstructionIL = {
                 il.const(1,1)
                 )
             ),
-    'LCALL': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.call(SourceOperandsIL[dst_op] (
-        il, width, dst, dst_value)),
-    'ACALL': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.call(SourceOperandsIL[dst_op] (
-        il, width, dst, dst_value)),
-    'CLR': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: clear_bits(il, dst_op, dst, dst_value), 
-    'CLR C': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.set_flag('C', il.const(0,0)), 
+    'LCALL': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.call(il.const(2, dst)),
+    'ACALL': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.call(il.const(2, dst)),
+    'CLR': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: clear_bits(il, src_op, dst_op, src, dst, width, src_value, dst_value),
+    #'CLR': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.unimplemented(), 
+    #'CLR C': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.unimplemented(), 
+    #'CLR C': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: il.set_flag('C', il.const(0,0)), 
     'ADD': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: DestOperandsIL[dst_op](il, width, dst, dst_value, 
             il.add(width, SourceOperandsIL[src_op](il, width, src, src_value), SourceOperandsIL[dst_op](il, width, dst, dst_value),
             flags='cacov')
@@ -491,22 +555,23 @@ InstructionIL = {
 #        il.get_label_for_address(Architecture['i8051'], il.current_address+2)
 #        )
 #        ),
-    'DJNZ': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: [
+    'DJNZ': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: 
+            djnz_branch(il, src_op, dst_op, src, dst, src_value, dst_value),     
+        #[
             #dst_value = length to jump 
             #decrement the destination
-            DestOperandsIL[dst_op](il, width, dst, dst_value,
-                il.sub(width, SourceOperandsIL[dst_op](il, width, dst, dst_value), il.const(width, 1))),
-            None
-            #branch if not equal 
-            #cond_branch(il, 
-            #    il.compare_not_equal(width, 
-            #        SourceOperandIL[dst_op](il, width, dst, dst_value), 
-            #        il.const(1,0)
-            #        ),
-            #    il.const(2, src),
-            #    dst_value 
-            #    ),
-        ],
+            #DestOperandsIL[dst_op](il, width, dst, dst_value,
+            #    il.sub(width, SourceOperandsIL[dst_op](il, width, dst, dst_value), il.const(width, 1))),
+            #(
+            #    cond_branch(il, 
+            #    il.compare_not_equal(1, 
+            #        SourceOperandsIL[dst_op](il, width, dst, dst_value), 
+            #        il.const(1,0)), 
+            #    il.const(2, src), 
+            #    width
+            #    )
+            #) if True else None
+            #],
     'JC': lambda il, src_op, dst_op, src, dst, width, src_value, dst_value: cond_branch(
             il, 
             il.compare_equal(0, il.flag('C'), il.const(0, 1)), 
@@ -588,23 +653,28 @@ InstructionIL = {
  
 }
 
-def clear_bits(il, operator, dst, dst_value):
-    if operator == BIT_INDEXED_MODE:
+def clear_bits(il, src_op, dst_op, src, dst, width, src_value, dst_value):
+    #log_debug("Clear Bits =  il={}, src_op={}, dst_op={}, src={}, dst={}, width={}, src_value={}, dst_value={}".format(il, src_op, dst_op, src, dst, width, src_value, dst_value))
+    if dst_op == BIT_INDEXED_MODE:
         il.append(
             il.store(1, 
-                il.const(2,dst),
+                src_value, #address to clear
+                il.const(1,src_value),
                 il.and_expr(
                     il.load(1, 
-                        il.const(2,dst)), 
-                    il.const(1, dst_value)
-                    )
+                        il.const(1,src_value)), 
+                    il.const(1, il.not_expr(1,dst_value))
                 )
             )
-    elif operator == REGISTER_MODE: 
+        )
+    elif dst_op == REGISTER_MODE: 
         il.append(
-                il.set_reg(1, dst,il.const(1,0))
-                )
-    return None
+            il.set_reg(1, dst,il.const(1,0))
+        )
+    if dst_op == FLAG_MODE:
+        il.append( 
+            il.set_flag('C', il.const(0, 0)),
+        )
 
 class i8051(Architecture):
     name = 'i8051'
@@ -740,7 +810,7 @@ class i8051(Architecture):
             return 'ACALL', 1, None, DIRECT_MODE, None, return_addr, 2, None, None  
         elif instruction == 0x12: 
             code_addr = struct.unpack('>H', data[1:3])[0] 
-            return 'LCALL', 2, None, DIRECT_MODE, None, code_addr, 3, None, None 
+            return 'LCALL', 1, None, DIRECT_MODE, None, code_addr, 3, None, None 
         elif instruction == 0x13: 
             return 'RRC', 0, None, REGISTER_MODE, None, 'A', 1, None, None 
         elif instruction == 0x14: 
@@ -994,6 +1064,8 @@ class i8051(Architecture):
             return 'XRL',   1, REGISTER_MODE, REGISTER_MODE, 'R7', 'A', 1, None, None 
         elif instruction == 0x70: 
             rel_addr = struct.unpack('>B', data[1])[0] 
+            signed_number = ctypes.c_byte(rel_addr).value 
+            jump_address = addr + 2 + signed_number
             return 'JNZ',   1, None, DIRECT_MODE, None, rel_addr, 2, None, None 
         elif instruction == 0x71: 
             (high_address,low_address) = struct.unpack('>BB', data[0:2])
@@ -1045,7 +1117,7 @@ class i8051(Architecture):
             offset = struct.unpack('>B',data[1])[0]
             signed_number = ctypes.c_byte(offset).value 
             jump_address = addr + 2 + signed_number 
-            return 'SJMP',  1, None, DIRECT_MODE, None, jump_address, 2, None, None 
+            return 'SJMP',  2, None, DIRECT_MODE, None, jump_address, 2, None, None 
         elif instruction == 0x81: 
             (high_address,low_address) = struct.unpack('>BB', data[0:2])
             direct_addr = ((high_address & 0xe0 >> 5) << 8) | low_address 
@@ -1062,7 +1134,7 @@ class i8051(Architecture):
             return 'DIV AB',  0, REGISTER_MODE, REGISTER_MODE, 'B', 'A', 1, None, None
         elif instruction == 0x85: 
             (iram_addr_to, iram_addr_from) = struct.unpack('>BB',data[1:3]) 
-            return 'MOV',   2, DIRECT_MODE, DIRECT_MODE, iram_addr_from, iram_addr_to, 3, None,None 
+            return 'MOV',  1, DIRECT_MODE, DIRECT_MODE, iram_addr_from, iram_addr_to, 3, None,None 
         elif instruction == 0x86: 
             iram_addr = struct.unpack('>B', data[1])[0] 
             return 'MOV', 1, REGISTER_MODE, DIRECT_MODE, 'R0', iram_addr, 2, None, None 
@@ -1105,7 +1177,7 @@ class i8051(Architecture):
             address_int = struct.unpack('>B', data[1])[0] 
             bit_to_set = 1 << (address_int % 8)
             bit_address = address_int - (address_int % 8)
-            return 'MOV', 1, BIT_CLEAR_MODE, DIRECT_MODE, bit_address, bit_address, 2, bit_to_set, bit_to_set 
+            return 'MOV', 1, FLAG_MODE, DIRECT_MODE, 'C', bit_address, 2, bit_to_set, bit_to_set 
         elif instruction == 0x93: 
             return 'MOVC',   1, CODE_MODE, REGISTER_MODE, 'A', 'A', 1, 'DPTR', None 
         elif instruction == 0x94: 
@@ -1145,9 +1217,9 @@ class i8051(Architecture):
             address_int = struct.unpack('>B', data[1])[0] 
             bit_to_set = 1 << (address_int % 8)
             bit_addr = address_int - (address_int % 8) 
-            return 'MOV', 1, DIRECT_MODE, BIT_CLEAR_MODE, bit_addr, bit_addr, 2, bit_to_set, bit_to_set 
+            return 'MOV', 1, DIRECT_MODE, FLAG_MODE, bit_addr, 'C', 2, bit_to_set, bit_to_set 
         elif instruction == 0xa3: 
-            return 'INC', 1, None, REGISTER_MODE, None, 'DPTR', 1, None, None
+            return 'INC', 2, None, REGISTER_MODE, None, 'DPTR', 1, None, None
         elif instruction == 0xa4: 
             return 'MUL AB', 1,  REGISTER_MODE, REGISTER_MODE, 'B', 'A', 1, 'A', 'B' 
         elif instruction == 0xa5: 
@@ -1268,11 +1340,12 @@ class i8051(Architecture):
             return 'AJMP', 1, None, DIRECT_MODE, None, return_addr, 2, None, None 
         elif instruction == 0xc2: 
             bit_addr = struct.unpack('>B', data[1])[0] 
-            address_to_check = bit_addr  - (bit_addr % 8)
-            bit_to_clear = (~(1 << (bit_addr % 8)) & 0xff) 
-            return 'CLR', 1, None, BIT_ADDRESS_MODE, None, bit_addr, 2, None, None 
+            address_to_check = ((0x20 * 8) + bit_addr) // 8
+            bitval = 1 << bit_addr % 8
+            #bit_to_clear = (~(1 << (bit_addr % 8)) & 0xff) 
+            return 'CLR', 1, None, BIT_ADDRESS_MODE, None, bit_addr, 2, address_to_check, bitval 
         elif instruction == 0xc3: 
-            return 'CLR C', 1,  None, None, None, None, 1, None, None 
+            return 'CLR', 1,  None, FLAG_MODE, None, 'C', 1, 0, None 
         elif instruction == 0xc4: 
             return 'SWAP', 0,  None, REGISTER_MODE, None, 'A', 1, None, None
         elif instruction == 0xc5: 
@@ -1311,16 +1384,15 @@ class i8051(Architecture):
             address_to_write = ((0x20 * 8) + address_int) // 8
             #address_to_write = address_int - (address_int % 8) 
             bit_to_set = 1 << (address_int % 8)
-            return 'SETB', 1, None, BIT_ADDRESS_MODE, None, address_to_write, 2, None, bit_to_set 
-
+            return 'SETB', 1, None, BIT_ADDRESS_MODE, None, address_int, 2, address_to_write, bit_to_set 
         elif instruction == 0xd3: 
-            return 'SETB C', 1, None, None, None, None, 1, None, None 
+            return 'SETB', 1, None, FLAG_MODE, None, 'C', 1, None, None 
         elif instruction == 0xd4: 
             return 'DA',   1, None, REGISTER_MODE, None, 'A', 1, None, None
         elif instruction == 0xd5: 
             (iram_addr, rel_addr) = struct.unpack('>BB', data[1:3]) 
             signed_number = ctypes.c_byte(rel_addr).value
-            jump_address = addr + 2 + signed_number
+            jump_address = addr + 3 + signed_number
             jump_length = 3 #instruction length
             return 'DJNZ',   1, DIRECT_MODE, DIRECT_MODE, rel_addr, iram_addr, 3, jump_address, jump_length 
         elif instruction == 0xd6: 
@@ -1332,51 +1404,51 @@ class i8051(Architecture):
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 #instruction length
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R0', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R0', 2, jump_address, jump_length  
         elif instruction == 0xd9: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R1', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R1', 2, jump_address, jump_length  
         elif instruction == 0xda: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R2', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R2', 2, jump_address, jump_length  
         elif instruction == 0xdb: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R3', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R3', 2, jump_address, jump_length  
         elif instruction == 0xdc: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R4', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R4', 2, jump_address, jump_length  
         elif instruction == 0xdd: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R5', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R5', 2, jump_address, jump_length  
         elif instruction == 0xde: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R6', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R6', 2, jump_address, jump_length  
         elif instruction == 0xdf: 
             rel_addr = struct.unpack('>B', data[1])[0] 
             signed_number = ctypes.c_byte(rel_addr).value
             jump_address = addr + 2 + signed_number
             jump_length = 2 
-            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R7', 2, None, jump_length  
+            return 'DJNZ',   1, DIRECT_MODE, REGISTER_MODE, jump_address, 'R7', 2, jump_address, jump_length  
         elif instruction == 0xe0: #MOVX A,@DPTR
-            return 'MOVX',   1, INDEXED_MODE, REGISTER_MODE, 'DPTR', 'A', 1, None, None 
+            return 'MOVX',   2, INDEXED_MODE, REGISTER_MODE, 'DPTR', 'A', 1, None, None 
         elif instruction == 0xe1: 
             (high_address,low_address) = struct.unpack('>BB', data[0:2])
             direct_addr = ((high_address & 0xe0 >> 5) << 8) | low_address 
@@ -1412,7 +1484,7 @@ class i8051(Architecture):
         elif instruction == 0xef: 
             return 'MOV',   1, REGISTER_MODE, REGISTER_MODE, 'R7', 'A', 1, None, None 
         elif instruction == 0xf0: #MOVX @DPTR,A 
-            return 'MOVX',  1, REGISTER_MODE, INDEXED_MODE, 'A', 'DPTR', 1, None, None 
+            return 'MOVX',  2, REGISTER_MODE, INDEXED_MODE, 'A', 'DPTR', 1, None, None 
         elif instruction == 0xf1: 
             (high_address,low_address) = struct.unpack('>BB', data[0:2])
             direct_addr = ((high_address & 0xe0 >> 5) << 8) | low_address 
@@ -1513,6 +1585,7 @@ class i8051(Architecture):
                 il, src_operand, dst_operand, src, dst, width, src_value, dst_value)
             if isinstance(il_instr, list):
                 for i in [i for i in il_instr if i is not None]:
+                    #log_debug("instr={} LLIL={}".format(instr, i.index)) 
                     il.append(i)
             elif il_instr is not None:
                 il.append(il_instr)
